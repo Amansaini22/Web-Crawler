@@ -13,73 +13,88 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CrawlerService = void 0;
 const common_1 = require("@nestjs/common");
 const crawler_repository_1 = require("./infrastructure/persistence/crawler.repository");
+const p_limit_1 = require("p-limit");
 let CrawlerService = CrawlerService_1 = class CrawlerService {
     constructor(crawlerRepository) {
         this.crawlerRepository = crawlerRepository;
         this.logger = new common_1.Logger(CrawlerService_1.name);
+        this.retryWithBackoff = async (fn, retries = 3, delay = 1000) => {
+            let attempt = 0;
+            while (attempt < retries) {
+                try {
+                    return await fn();
+                }
+                catch (error) {
+                    attempt++;
+                    if (attempt >= retries)
+                        throw error;
+                    console.error(`Retrying... Attempt ${attempt}`);
+                    await new Promise((resolve) => setTimeout(resolve, delay * attempt));
+                }
+            }
+        };
     }
     async create(createCrawlerDto) {
         return this.crawlerRepository.create(createCrawlerDto);
     }
-    async discoverProductUrls(domains) {
-        this.logger.log(`Starting crawl for domains: ${domains.join(', ')}`);
-        const puppeteer = require('puppeteer-extra');
-        const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-        puppeteer.use(StealthPlugin());
+    getRandomUserAgent() {
         const userAgents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         ];
+        return userAgents[Math.floor(Math.random() * userAgents.length)];
+    }
+    async discoverProductUrls(domains) {
+        const puppeteer = require('puppeteer-extra');
+        const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+        puppeteer.use(StealthPlugin());
         const browser = await puppeteer.launch({ headless: true });
         const results = [];
+        const limit = (0, p_limit_1.default)(5);
         try {
-            for (const domain of domains) {
+            await Promise.all(domains.map((domain) => limit(async () => {
                 const page = await browser.newPage();
-                const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+                const userAgent = this.getRandomUserAgent();
                 await page.setUserAgent(userAgent);
-                this.logger.log(`Crawling domain: ${domain}`);
+                console.log(`Crawling domain: ${domain}`);
                 try {
-                    await page.goto(`https://${domain}`, { waitUntil: 'networkidle2' });
+                    await this.retryWithBackoff(() => page.goto(`https://${domain}`, { waitUntil: 'networkidle2' }));
                     await this.scrollToLoadMore(page);
-                    const urls = await page.evaluate(() => {
+                    const universalPatterns = ['/product/', '/item/', '/p/', '/shop/', '/buy/'];
+                    const urls = await page.evaluate((patterns) => {
                         const links = Array.from(document.querySelectorAll('a'));
                         return links
                             .map((link) => link.href)
-                            .filter((url) => url.includes('/product/') || url.includes('/item/') || url.includes('/p/') ||
-                            url.includes('/shop/') || url.includes('/buy/'));
-                    });
+                            .filter((url) => patterns.some((pattern) => url.includes(pattern)));
+                    }, universalPatterns);
                     const uniqueUrls = Array.from(new Set(urls));
-                    this.logger.log(`Discovered ${uniqueUrls.length} product URLs on ${domain}`);
-                    const existingEntry = await this.crawlerRepository.findOne({ domain: domain });
-                    console.log('Existing Entry:', existingEntry);
-                    if (existingEntry) {
-                        const allUrls = Array.from(new Set([...existingEntry.discoveredUrls, ...uniqueUrls]));
-                        await this.crawlerRepository.update(existingEntry.id.toString(), { discoveredUrls: allUrls });
-                        this.logger.log(`Updated domain: ${domain} with ${allUrls.length} total URLs`);
+                    console.log(`Discovered ${uniqueUrls.length} product URLs on ${domain}`);
+                    try {
+                        const existingEntry = await this.crawlerRepository.findOne({ domain });
+                        if (existingEntry) {
+                            const allUrls = Array.from(new Set([...existingEntry.discoveredUrls, ...uniqueUrls]));
+                            await this.crawlerRepository.update(existingEntry._id.toString(), { discoveredUrls: allUrls });
+                        }
+                        else {
+                            await this.crawlerRepository.create({ domain, discoveredUrls: uniqueUrls, isActive: true });
+                        }
                     }
-                    else {
-                        await this.crawlerRepository.create({
-                            domain,
-                            discoveredUrls: uniqueUrls,
-                            isActive: true,
-                        });
-                        this.logger.log(`Created new entry for domain: ${domain}`);
+                    catch (error) {
+                        console.error(`Error updating database for domain: ${domain}`, error.message);
                     }
                     results.push({ domain, urls: uniqueUrls });
-                    await this.getRandomDelay(2000, 5000);
                 }
                 catch (error) {
-                    this.logger.error(`Error crawling domain: ${domain}`, error.stack);
+                    console.error(`Error crawling domain: ${domain}`, error.message);
                 }
                 finally {
                     await page.close();
                 }
-            }
+            })));
         }
         catch (error) {
-            this.logger.error('Error during the crawling process', error.stack);
-            throw error;
+            console.error('Error during the crawling process', error.message);
         }
         finally {
             await browser.close();
@@ -96,10 +111,6 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 await new Promise((resolve) => setTimeout(resolve, 300));
             }
         });
-    }
-    async getRandomDelay(min, max) {
-        const delay = Math.random() * (max - min) + min;
-        return new Promise((resolve) => setTimeout(resolve, delay));
     }
     findManyWithPagination({ filterOptions, sortOptions, paginationOptions, }) {
         return this.crawlerRepository.findManyWithPagination({
