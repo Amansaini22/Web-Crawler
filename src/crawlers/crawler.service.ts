@@ -82,7 +82,7 @@ export class CrawlerService {
                 const existingEntry = await this.crawlerRepository.findOne({ domain });
                 if (existingEntry) {
                   const allUrls = Array.from(new Set([...existingEntry.discoveredUrls, ...uniqueUrls]));
-                  await this.crawlerRepository.update(existingEntry._id.toString(), { discoveredUrls: allUrls });
+                  await this.crawlerRepository.update(existingEntry.id.toString(), { discoveredUrls: allUrls });
                 } else {
                   await this.crawlerRepository.create({ domain, discoveredUrls: uniqueUrls, isActive: true });
                 }
