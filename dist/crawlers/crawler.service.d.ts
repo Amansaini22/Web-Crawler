@@ -10,12 +10,13 @@ export declare class CrawlerService {
     private readonly logger;
     constructor(crawlerRepository: CrawlerRepository);
     create(createCrawlerDto: CreateCrawlerDto): Promise<Crawler>;
+    private getRandomUserAgent;
+    private retryWithBackoff;
     discoverProductUrls(domains: string[]): Promise<{
         domain: string;
         urls: string[];
     }[]>;
     private scrollToLoadMore;
-    private getRandomDelay;
     findManyWithPagination({ filterOptions, sortOptions, paginationOptions, }: {
         filterOptions?: FilterCrawlerDto | null;
         sortOptions?: SortCrawlerDto[] | null;

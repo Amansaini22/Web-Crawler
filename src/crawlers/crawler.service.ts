@@ -7,9 +7,9 @@ import { UpdateCrawlerDto } from './dto/update-crawler.dto';
 import {
   FilterCrawlerDto,
   SortCrawlerDto,
-  QueryCrawlerDto,
 } from './dto/query-crawler.dto';
 import { IPaginationOptions } from '../utils/types/pagination-options';
+import pLimit from 'p-limit';
 
 @Injectable()
 export class CrawlerService {
@@ -21,76 +21,86 @@ export class CrawlerService {
     return this.crawlerRepository.create(createCrawlerDto);
   }
 
-  async discoverProductUrls(domains: string[]): Promise<{ domain: string; urls: string[] }[]> {
-    this.logger.log(`Starting crawl for domains: ${domains.join(', ')}`);
-  
-    const puppeteer = require('puppeteer-extra');
-    const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-    puppeteer.use(StealthPlugin());
-  
+  private getRandomUserAgent(): string {
     const userAgents = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+  }
+
+  private retryWithBackoff = async (fn: () => Promise<any>, retries = 3, delay = 1000): Promise<any> => {
+    let attempt = 0;
+    while (attempt < retries) {
+      try {
+        return await fn();
+      } catch (error) {
+        attempt++;
+        if (attempt >= retries) throw error;
+        console.error(`Retrying... Attempt ${attempt}`);
+        await new Promise((resolve) => setTimeout(resolve, delay * attempt)); // Exponential backoff
+      }
+    }
+  };
+
+  async discoverProductUrls(domains: string[]): Promise<{ domain: string; urls: string[] }[]> {
+    const puppeteer = require('puppeteer-extra');
+    const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+    puppeteer.use(StealthPlugin());
   
     const browser = await puppeteer.launch({ headless: true });
     const results: { domain: string; urls: string[] }[] = [];
+    const limit = pLimit(5);
   
     try {
-      for (const domain of domains) {
-        const page = await browser.newPage();
-        const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
-        await page.setUserAgent(userAgent);
+      await Promise.all(
+        domains.map((domain) =>
+          limit(async () => {
+            const page = await browser.newPage();
+            const userAgent = this.getRandomUserAgent();
+            await page.setUserAgent(userAgent);
   
-        this.logger.log(`Crawling domain: ${domain}`);
-        try {
-          await page.goto(`https://${domain}`, { waitUntil: 'networkidle2' });
+            console.log(`Crawling domain: ${domain}`);
+            try {
+              await this.retryWithBackoff(() => page.goto(`https://${domain}`, { waitUntil: 'networkidle2' }));
   
-          await this.scrollToLoadMore(page);
+              await this.scrollToLoadMore(page);
   
-          const urls = await page.evaluate((): string[] => {
-            const links = Array.from(document.querySelectorAll('a'));
-            return links
-            .map((link) => (link as HTMLAnchorElement).href)
-            .filter(
-              (url) =>
-                url.includes('/product/') || url.includes('/item/') || url.includes('/p/') ||
-                url.includes('/shop/') || url.includes('/buy/'),
-            );
-          });
+              const universalPatterns = ['/product/', '/item/', '/p/', '/shop/', '/buy/'];
+              const urls = await page.evaluate((patterns: string[]) => {
+                const links = Array.from(document.querySelectorAll('a'));
+                return links
+                  .map((link) => (link as HTMLAnchorElement).href)
+                  .filter((url) => patterns.some((pattern) => url.includes(pattern)));
+              }, universalPatterns);
   
-          const uniqueUrls: string[] = Array.from(new Set(urls));
+              const uniqueUrls: string[] = Array.from(new Set(urls));
+              console.log(`Discovered ${uniqueUrls.length} product URLs on ${domain}`);
   
-          this.logger.log(`Discovered ${uniqueUrls.length} product URLs on ${domain}`);
+              try {
+                const existingEntry = await this.crawlerRepository.findOne({ domain });
+                if (existingEntry) {
+                  const allUrls = Array.from(new Set([...existingEntry.discoveredUrls, ...uniqueUrls]));
+                  await this.crawlerRepository.update(existingEntry._id.toString(), { discoveredUrls: allUrls });
+                } else {
+                  await this.crawlerRepository.create({ domain, discoveredUrls: uniqueUrls, isActive: true });
+                }
+              } catch (error) {
+                console.error(`Error updating database for domain: ${domain}`, error.message);
+              }
   
-          const existingEntry = await this.crawlerRepository.findOne({ domain: domain });
-          console.log('Existing Entry:', existingEntry);
-          if (existingEntry) {
-            const allUrls = Array.from(new Set([...existingEntry.discoveredUrls, ...uniqueUrls]));
-            await this.crawlerRepository.update(existingEntry.id.toString(), { discoveredUrls: allUrls });
-            this.logger.log(`Updated domain: ${domain} with ${allUrls.length} total URLs`);
-          } else {
-            await this.crawlerRepository.create({
-              domain,
-              discoveredUrls: uniqueUrls,
-              isActive: true,
-            });
-            this.logger.log(`Created new entry for domain: ${domain}`);
-          }
-  
-          results.push({ domain, urls: uniqueUrls });
-  
-          await this.getRandomDelay(2000, 5000);
-        } catch (error) {
-          this.logger.error(`Error crawling domain: ${domain}`, error.stack);
-        } finally {
-          await page.close();
-        }
-      }
+              results.push({ domain, urls: uniqueUrls });
+            } catch (error) {
+              console.error(`Error crawling domain: ${domain}`, error.message);
+            } finally {
+              await page.close();
+            }
+          }),
+        ),
+      );
     } catch (error) {
-      this.logger.error('Error during the crawling process', error.stack);
-      throw error;
+      console.error('Error during the crawling process', error.message);
     } finally {
       await browser.close();
     }
@@ -108,11 +118,6 @@ export class CrawlerService {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     });
-  }
-  
-  private async getRandomDelay(min: number, max: number): Promise<void> {
-    const delay = Math.random() * (max - min) + min;
-    return new Promise((resolve) => setTimeout(resolve, delay));
   }
 
   findManyWithPagination({
